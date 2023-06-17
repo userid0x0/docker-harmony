@@ -1,0 +1,218 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+version: '3.4'
+
+services:
+  traefik:
+    image: traefik:v2.10
+    container_name: reverse_proxy
+    restart: unless-stopped
+    command:
+      - '--global.sendAnonymousUsage=false'
+      # Providers:
+      # Docker (controlled by labels)
+      - '--providers.docker'
+      - '--providers.docker.exposedbydefault=false'
+      - '--providers.docker.network=traefik_default'
+      # File (watch folder `/providers`)
+      - '--providers.file'
+      - '--providers.file.directory=/providers'
+      - '--providers.file.watch=true'
+      # create entrypoints: epWeb + epWebsecure
+      - '--entrypoints.epWeb.address=:80'
+      - '--entrypoints.epWebsecure.address=:443'
+      - '--ping=true'
+      - '--api.insecure=true'
+    ports:
+      - 80:80
+      - 443:443
+      - 8080:8080
+    volumes:
+      - ./providers/:/providers
+      - ./certs/:/certs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # docker may export these variables e.g. if you are in a company network
+      # ensure the proxy is not set as we run locally
+      - 'HTTP_PROXY='
+      - 'http_proxy='
+      - 'HTTPS_PROXY='
+      - 'https_proxy='
+      - 'NO_PROXY='
+      - 'no_proxy='
+    healthcheck:
+      test: ['CMD', 'traefik', 'healthcheck', '--ping']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - traefik_default
+
+  bugzilla.localhost:
+    build: &bmo_build
+      context: ./bmo
+      dockerfile: ./Dockerfile
+    command: dev_httpd
+    volumes:
+      - data:/app/data
+      - .:/mnt/sync
+    tmpfs:
+      - /tmp
+      - /run
+    environment: &bmo_env
+      - 'BMO_inbound_proxies=*'
+      - BMO_db_host=bmo.db
+      - BMO_db_name=bugs
+      - BMO_db_pass=bugs
+      - BMO_db_user=bugs
+      - BMO_memcached_namespace=bugzilla
+      - BMO_memcached_servers=memcached:11211
+      - BMO_ses_username=ses@mozilla.bugs
+      - BMO_ses_password=password123456789!
+      - BMO_urlbase=http://bugzilla.localhost/
+      - BUGZILLA_ALLOW_INSECURE_HTTP=1
+      - BZ_ANSWERS_FILE=/app/conf/checksetup_answers.txt
+      - HTTP_BACKEND=morbo
+      - LOCALCONFIG_ENV=1
+      - LOG4PERL_CONFIG_FILE=log4perl-docker.conf
+      - MOJO_LISTEN=http://*:80
+      - PORT=80
+      # docker may export these variables e.g. if you are in a company network
+      # ensure the proxy is not set as we run locally
+      - 'HTTP_PROXY='
+      - 'http_proxy='
+      - 'HTTPS_PROXY='
+      - 'https_proxy='
+      - 'NO_PROXY='
+      - 'no_proxy='
+    depends_on:
+      - bmo.db
+      - memcached
+      - tinyproxy
+    restart: unless-stopped
+    networks:
+      - traefik_default
+      - default
+    labels:
+      - traefik.enable=true
+      # Router: http/https subdomain
+      - traefik.http.routers.rSubdomainRedirectHttp.rule=Host(`bugzilla.localhost`)
+      - traefik.http.routers.rSubdomainRedirectHttp.entrypoints=epWeb
+      - traefik.http.routers.rSubdomainRedirectHttp.middlewares=mwHttpToHttps@file
+      - traefik.http.routers.rSubdomainRedirectHttps.rule=Host(`bugzilla.localhost`)
+      - traefik.http.routers.rSubdomainRedirectHttps.entrypoints=epWebsecure
+      - traefik.http.routers.rSubdomainRedirectHttps.tls=true
+      # EXPOSE is set to 8000 - force Traefik to 80
+      - traefik.http.routers.rSubdomainRedirectHttps.service=sBmoExposeOverride
+      - traefik.http.services.sBmoExposeOverride.loadbalancer.server.port=80
+
+  bmo.jobqueue:
+    build: *bmo_build
+    command: jobqueue
+    volumes:
+      - data:/app/data
+    tmpfs:
+      - /tmp
+      - /run
+    environment: *bmo_env
+    restart: unless-stopped
+    depends_on:
+      - bmo.db
+      - memcached
+
+  bmo.feed:
+    build: *bmo_build
+    command:
+      - perl
+      - extensions/PhabBugz/bin/phabbugz_feed.pl
+      - start
+      - '-d'
+      - '-f'
+    volumes:
+      - data:/app/data
+    tmpfs:
+      - /tmp
+      - /run
+    environment: *bmo_env
+    restart: unless-stopped
+    depends_on:
+      - bmo.db
+      - memcached
+
+
+  bmo.pushd:
+    build: *bmo_build
+    command:
+      - perl
+      - extensions/Push/bin/bugzilla-pushd.pl
+      - start
+      - '-d'
+      - '-f'
+    volumes:
+      - data:/app/data
+    tmpfs:
+      - /tmp
+      - /run
+    environment: *bmo_env
+    restart: unless-stopped
+    depends_on:
+      - bmo.db
+      - memcached
+
+  bmo.db:
+    image: mariadb:11
+    volumes:
+      - mariaDB:/var/lib/mysql
+    tmpfs:
+      - /tmp
+    logging:
+      driver: "none"
+    environment:
+      - MARIADB_DATABASE=bugs
+      - MARIADB_USER=bugs
+      - MARIADB_PASSWORD=bugs
+      - MARIADB_ROOT_PASSWORD=bugs
+      - MARIADB_ALLOW_EMPTY_PASSWORD=1
+    restart: unless-stopped
+
+  memcached:
+    image: memcached:latest
+
+  whoami:
+    image: traefik/whoami:latest
+    container_name: whoami
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      # Routers are https only (tls=true)
+      # Routers 1: by path
+      - traefik.http.routers.rWhoamiPath.rule=Path(`/admin/whoami`)
+      - traefik.http.routers.rWhoamiPath.entrypoints=epWebsecure
+      - traefik.http.routers.rWhoamiPath.tls=true
+      - traefik.http.routers.rWhoamiPath.middlewares=mwWhoamiRemovePath
+      # middlewares
+      ## remove-path: strip prefix /admin/whoami
+      - traefik.http.middlewares.mwWhoamiRemovePath.stripprefix.prefixes=/admin/whoami
+    networks:
+      - default
+      - traefik_default
+      
+  tinyproxy:
+    build:
+      context: bmo/docker/tinyproxy
+      dockerfile: ./Dockerfile
+    ports:
+      - "1080:1080"
+
+networks:
+  # traefik_default is the default name for a traefik network - specify this explicitly here
+  # external means it needs to exist before `docker compose up`
+  traefik_default:
+    external: true
+  default:
+      
+volumes:
+  mariaDB:
+  data:

@@ -1,0 +1,4 @@
+[submodule "bmo"]
+	path = bmo
+	url = git@github.com:bugzilla/harmony.git
+	branch = main
